@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""tesla-api -- lean Tesla Fleet API CLI (stdlib only).
+
+Subcommands:
+  auth-url                                print the Tesla OAuth authorize URL
+  exchange <callback-url>                 trade the authorization code for tokens
+  vehicles                                list vehicles on the account
+  state --vin VIN                         live (or cached) vehicle state summary
+  chargers --vin VIN                       Tesla chargers near the car
+  ocm [--vin VIN | --lat f --lon f]       third-party chargers via OpenChargeMap
+  wake --vin VIN                          wake the vehicle (billable)
+  command --vin VIN --command NAME [--param k=v ...]
+                                          signed remote command via signing proxy
+
+Config/tokens: $TESLA_CONFIG_DIR or ~/.config/tesla (700 dir, 600 files).
+Signed commands run on a separate signing host over SSH -- the private key
+never leaves that host. Configure via env:
+  TESLA_SSH_HOST        SSH target for signed commands (default: budupi)
+  TESLA_CMD_SCRIPT      remote command script (default: ~/tesla-key/tesla-cmd.sh)
+  TESLA_PARTNER_DOMAIN  partner domain used in the phone-pairing URL
+  TESLA_USER_TZ         IANA timezone for the PT timestamp column
+"""
+import argparse
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    USER_TZ = ZoneInfo(os.environ.get("TESLA_USER_TZ", "America/Los_Angeles"))
+except Exception:
+    USER_TZ = None
+
+CONFIG_DIR = os.environ.get("TESLA_CONFIG_DIR",
+                            os.path.expanduser("~/.config/tesla"))
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
+AUTH_URL = "https://auth.tesla.com/oauth2/v3/authorize"
+TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+REDIRECT_URI = "http://localhost:3000/callback"
+SCOPES = ("openid offline_access vehicle_device_data vehicle_location "
+          "vehicle_cmds vehicle_charging_cmds")
+
+SSH_HOST = os.environ.get("TESLA_SSH_HOST", "budupi")
+CMD_SCRIPT = os.environ.get("TESLA_CMD_SCRIPT", "~/tesla-key/tesla-cmd.sh")
+PARTNER_DOMAIN = os.environ.get("TESLA_PARTNER_DOMAIN", "")
+
+
+def pairing_hint():
+    if PARTNER_DOMAIN:
+        return (f" -- the app's virtual key is not paired to the car yet. "
+                f"Pair it from a phone at https://tesla.com/_ak/{PARTNER_DOMAIN}")
+    return (" -- the app's virtual key is not paired to the car yet. "
+            "Pair it from your phone (see pi/SETUP.md)")
+
+
+def die(msg, code=2):
+    print(f"tesla-api: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        die(f"no config at {CONFIG_PATH} -- client_id/client_secret not set up yet")
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    for k in ("client_id", "client_secret"):
+        if not cfg.get(k):
+            die(f"{k} missing in {CONFIG_PATH}")
+    cfg.setdefault("api_base", "https://fleet-api.prd.na.vn.cloud.tesla.com")
+    return cfg
+
+
+def load_tokens():
+    if not os.path.exists(TOKENS_PATH):
+        return {}
+    with open(TOKENS_PATH) as f:
+        return json.load(f)
+
+
+def save_tokens(tok):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    with open(TOKENS_PATH, "w") as f:
+        json.dump(tok, f)
+    os.chmod(TOKENS_PATH, 0o600)
+
+
+def token_request(data):
+    req = urllib.request.Request(TOKEN_URL, data=urllib.parse.urlencode(data).encode(),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            err = json.loads(body)
+            die(f"token request failed: {err.get('error')}: {err.get('error_description', '')}")
+        except json.JSONDecodeError:
+            die(f"token request failed (HTTP {e.code}): {body[:300]}")
+
+
+def cmd_auth_url(_args):
+    cfg = load_config()
+    q = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": cfg["client_id"],
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": secrets.token_hex(8),
+        "prompt": "consent",
+    })
+    print(f"{AUTH_URL}?{q}")
+    print()
+    print("Open the URL above, sign in, then run:")
+    print("  tesla-api exchange '<the full localhost callback URL from the address bar>'")
+    print("(the browser failing to load localhost is expected -- just copy the URL)")
+
+
+def cmd_exchange(args):
+    cfg = load_config()
+    parsed = urllib.parse.urlparse(args.callback_url)
+    code = urllib.parse.parse_qs(parsed.query).get("code", [None])[0]
+    if not code:
+        # maybe they pasted just the code
+        code = args.callback_url.strip()
+    if not code:
+        die("no authorization code found in that URL")
+    d = token_request({
+        "grant_type": "authorization_code",
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "code": code,
+        "audience": cfg["api_base"],
+        "redirect_uri": REDIRECT_URI,
+    })
+    if d.get("error"):
+        die(f"exchange failed: {d['error']}: {d.get('error_description', '')}")
+    tok = load_tokens()
+    tok["access_token"] = d["access_token"]
+    if d.get("refresh_token"):
+        tok["refresh_token"] = d["refresh_token"]
+    tok["expires_at"] = time.time() + int(d.get("expires_in", 28800)) - 60
+    save_tokens(tok)
+    # decode granted scopes from the JWT for confirmation
+    try:
+        payload = d["access_token"].split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        import base64
+        scp = json.loads(base64.urlsafe_b64decode(payload)).get("scp", [])
+    except Exception:
+        scp = []
+    print("ok -- tokens saved")
+    print("scopes granted:", " ".join(scp) if scp else "(unknown)")
+
+
+def refresh_tokens(cfg, tok):
+    if not tok.get("refresh_token"):
+        die("no refresh token -- run `tesla-api exchange` again")
+    d = token_request({
+        "grant_type": "refresh_token",
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "refresh_token": tok["refresh_token"],
+        "audience": cfg["api_base"],
+    })
+    if d.get("error"):
+        die(f"refresh failed: {d['error']}: {d.get('error_description', '')} -- re-run exchange")
+    tok["access_token"] = d["access_token"]
+    if d.get("refresh_token"):
+        tok["refresh_token"] = d["refresh_token"]
+    tok["expires_at"] = time.time() + int(d.get("expires_in", 28800)) - 60
+    save_tokens(tok)
+    return tok
+
+
+def access_token():
+    cfg = load_config()
+    tok = load_tokens()
+    if not tok.get("access_token"):
+        die("not connected -- run `tesla-api auth-url` first")
+    if tok.get("expires_at", 0) <= time.time() + 120:
+        tok = refresh_tokens(cfg, tok)
+    return cfg, tok["access_token"]
+
+
+def api(method, path, body=None, _retried=False):
+    cfg, token = access_token()
+    url = cfg["api_base"] + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors="replace")
+        if e.code == 401 and not _retried:
+            # token may have been revoked early; refresh once and retry
+            refresh_tokens(cfg, load_tokens())
+            return api(method, path, body, _retried=True)
+        try:
+            err = json.loads(raw)
+            msg = err.get("error") or err.get("response") or raw[:300]
+        except json.JSONDecodeError:
+            msg = raw[:300]
+        if e.code == 408:
+            die("vehicle is asleep or unreachable (HTTP 408). "
+                "State shown is the last cached data; use `wake` for fresh data.")
+        die(f"Tesla API error (HTTP {e.code}): {msg}")
+
+
+def vehicle_id_for_vin(vin):
+    d = api("GET", "/api/1/vehicles")
+    for v in d.get("response", []):
+        if v.get("vin") == vin:
+            return v["id"]
+    die(f"VIN {vin} not found on this account")
+
+
+def fmt_ts(ms):
+    """raw ms -> 'raw | UTC | local'."""
+    if not ms:
+        return "(unknown)"
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    utc = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    local = dt.astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if USER_TZ else "(tz unavailable)"
+    return f"{ms} | {utc} | {local}"
+
+
+def cmd_vehicles(_args):
+    d = api("GET", "/api/1/vehicles")
+    for v in d.get("response", []):
+        print(json.dumps({
+            "id": v.get("id"),
+            "vin": v.get("vin"),
+            "display_name": v.get("display_name"),
+            "state": v.get("state"),
+        }))
+
+
+def cmd_state(args):
+    vid = vehicle_id_for_vin(args.vin)
+    eps = "charge_state;climate_state;drive_state;vehicle_state;location_data"
+    d = api("GET", f"/api/1/vehicles/{vid}/vehicle_data?endpoints={eps}")
+    r = d.get("response", {})
+    cs, cl, dr, vs = (r.get("charge_state", {}), r.get("climate_state", {}),
+                      r.get("drive_state", {}), r.get("vehicle_state", {}))
+    lat, lon = dr.get("latitude"), dr.get("longitude")
+    lines = [
+        f"VIN {args.vin} ({vs.get('vehicle_name') or r.get('display_name') or ''})",
+        f"  state: {r.get('state')} (data as of {fmt_ts(dr.get('timestamp') or cs.get('timestamp'))})",
+        f"  battery: {cs.get('battery_level')}% ({cs.get('battery_range')} mi rated) "
+        f"-- charging: {cs.get('charging_state')}, limit {cs.get('charge_limit_soc')}%, "
+        f"power {cs.get('charger_power')} kW",
+        f"  location: {lat}, {lon}" + (f" (heading {dr.get('heading')} deg)" if dr.get('heading') is not None else ""),
+        f"  locked: {'yes' if vs.get('locked') else 'no'} | "
+        f"sentry: {'on' if vs.get('sentry_mode') else 'off'} | "
+        f"odometer: {vs.get('odometer')} mi",
+        f"  climate: {'on' if cl.get('is_climate_on') else 'off'} "
+        f"(inside {cl.get('inside_temp')}C / outside {cl.get('outside_temp')}C)",
+        f"  software: {vs.get('car_version')}",
+    ]
+    print("\n".join(lines))
+    print("RAW_JSON:" + json.dumps(r))
+
+
+def cmd_chargers(args):
+    """Charging sites near the car's current location (Tesla server-side)."""
+    d = api("GET", f"/api/1/vehicles/{args.vin}/nearby_charging_sites")
+    r = d.get("response", {})
+    sites = []
+    for key, val in r.items():
+        if isinstance(val, list):
+            for s in val:
+                if isinstance(s, dict) and "location" in s:
+                    loc = s.get("location", {})
+                    stalls = ""
+                    if s.get("total_stalls"):
+                        stalls = f" [{s.get('available_stalls')}/{s.get('total_stalls')} stalls]"
+                    sites.append({
+                        "name": s.get("name"),
+                        "type": s.get("type") or key,
+                        "distance_mi": s.get("distance_miles"),
+                        "lat": loc.get("lat"), "lon": loc.get("long"),
+                        "site_closed": s.get("site_closed", False),
+                        "stalls": stalls,
+                    })
+    sites.sort(key=lambda s: (s["distance_mi"] is None, s["distance_mi"]))
+    for s in sites:
+        closed = " [CLOSED]" if s["site_closed"] else ""
+        print(f"{s['distance_mi']} mi  {s['type']:12}  {s['name']}{s['stalls']}{closed}  ({s['lat']}, {s['lon']})")
+    print(f"\n({len(sites)} sites, data as of {fmt_ts(r.get('timestamp'))})")
+    print("RAW_JSON:" + json.dumps(r))
+
+
+def cmd_ocm(args):
+    """Third-party chargers via OpenChargeMap near a point (or the car's location).
+
+    The OCM API key lives in config.json (600) and is sent as the API's
+    required `key` query parameter, in-process only -- never printed/logged.
+    """
+    cfg = load_config()
+    key = cfg.get("ocm_api_key")
+    if not key:
+        die("no ocm_api_key in config -- add one to use third-party charger lookup")
+    lat, lon = args.lat, args.lon
+    if (lat is None or lon is None) and args.vin:
+        vid = vehicle_id_for_vin(args.vin)
+        d = api("GET", f"/api/1/vehicles/{vid}/vehicle_data?endpoints=drive_state")
+        dr = d.get("response", {}).get("drive_state", {})
+        lat, lon = dr.get("latitude"), dr.get("longitude")
+    if lat is None or lon is None:
+        die("no location -- pass --lat/--lon (the car's drive_state had no fix)")
+    params = {
+        "output": "json", "latitude": lat, "longitude": lon,
+        "distance": args.radius or 10, "distanceunit": "Miles",
+        "maxresults": args.limit or 25, "verbose": "false",
+        "key": key,
+    }
+    url = "https://api.openchargemap.io/v3/poi/?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "tesla-connector/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            pois = json.load(r)
+    except urllib.error.HTTPError as e:
+        die(f"OpenChargeMap error (HTTP {e.code}): {e.read().decode(errors='replace')[:200]}")
+    for p in pois:
+        ai = p.get("AddressInfo", {}) or {}
+        conns = p.get("Connections", []) or []
+        parts = []
+        for c in conns:
+            ct = (c.get("ConnectionType") or {}).get("Title") or "?"
+            kw = c.get("PowerKW")
+            q = c.get("Quantity") or 1
+            parts.append(f"{kw}kW x{q} {ct}" if kw else f"{ct} x{q}")
+        op = (p.get("OperatorInfo") or {}).get("Title") or "unknown operator"
+        usage = (p.get("UsageType") or {}).get("Title") or ""
+        status = (p.get("StatusType") or {}).get("Title") or ""
+        dist = ai.get("Distance")
+        dstr = f"{dist:.1f} mi" if isinstance(dist, (int, float)) else "?"
+        flags = " ".join(f"[{x}]" for x in (usage, status) if x)
+        print(f"{dstr:>8}  {op} -- {ai.get('Title')}"
+              + (f" {flags}" if flags else "")
+              + f"  {'; '.join(parts) or 'connectors unknown'}"
+              + f"  ({ai.get('Latitude')}, {ai.get('Longitude')})")
+    print(f"\n({len(pois)} sites within {params['distance']} mi of {lat}, {lon})")
+    print("RAW_JSON:" + json.dumps(pois)[:6000])
+
+
+def cmd_wake(args):
+    vid = vehicle_id_for_vin(args.vin)
+    d = api("POST", f"/api/1/vehicles/{vid}/wake_up", body={})
+    r = d.get("response", {})
+    print(f"ok -- vehicle state: {r.get('state')}")
+
+
+def cmd_command(args):
+    """Signed remote command via the on-demand proxy on the signing host.
+
+    The token travels to the signing host over the SSH channel's stdin
+    (never in the remote command line). The remote script starts the
+    official tesla/vehicle-command proxy, sends the signed command, stops
+    the proxy, and prints the response. The private key never leaves the
+    signing host.
+    """
+    params = {}
+    for p in args.param or []:
+        if "=" not in p:
+            die(f"bad --param {p!r}, expected k=v")
+        k, v = p.split("=", 1)
+        try:
+            v = json.loads(v)  # allow numbers/bools
+        except json.JSONDecodeError:
+            pass
+        params[k] = v
+    _, token = access_token()
+    ssh = ["ssh", "-o", "ConnectTimeout=20", SSH_HOST,
+           CMD_SCRIPT, args.vin, args.command, json.dumps(params)]
+    try:
+        p = subprocess.run(ssh, input=token.encode(), capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        die("command timed out after 180s")
+    out = p.stdout.decode(errors="replace").strip()
+    err = p.stderr.decode(errors="replace").strip()
+    if p.returncode != 0:
+        hint = pairing_hint() if "pair" in (err + out).lower() or "key" in err.lower() else ""
+        die(f"command failed: {(err or out or 'ssh error')[:500]}{hint}")
+    try:
+        d = json.loads(out)
+    except json.JSONDecodeError:
+        die(f"unexpected proxy response: {out[:300]}")
+    resp = d.get("response", d)
+    if isinstance(resp, dict) and resp.get("result") is False:
+        reason = resp.get("reason", json.dumps(resp)[:300])
+        hint = pairing_hint() if "pair" in reason.lower() else ""
+        die(f"command rejected: {reason}{hint}")
+    print(f"ok -- {args.command}: {json.dumps(resp)[:400]}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tesla-api")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("auth-url")
+    p = sub.add_parser("exchange"); p.add_argument("callback_url")
+    sub.add_parser("vehicles")
+    p = sub.add_parser("state"); p.add_argument("--vin", required=True)
+    p = sub.add_parser("chargers"); p.add_argument("--vin", required=True)
+    p = sub.add_parser("ocm")
+    p.add_argument("--vin")
+    p.add_argument("--lat", type=float)
+    p.add_argument("--lon", type=float)
+    p.add_argument("--radius", type=float, default=10)
+    p.add_argument("--limit", type=int, default=25)
+    p = sub.add_parser("wake"); p.add_argument("--vin", required=True)
+    p = sub.add_parser("command")
+    p.add_argument("--vin", required=True)
+    p.add_argument("--command", required=True)
+    p.add_argument("--param", action="append", default=[])
+    args = ap.parse_args()
+    {"auth-url": cmd_auth_url, "exchange": cmd_exchange, "vehicles": cmd_vehicles,
+     "state": cmd_state, "wake": cmd_wake, "command": cmd_command,
+     "chargers": cmd_chargers, "ocm": cmd_ocm}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
